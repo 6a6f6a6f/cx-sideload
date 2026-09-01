@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly PROGRAM_NAME="${0##*/}"
+readonly DEFAULT_BOTTLES_DIR="${CROSSOVER_BOTTLES_DIR:-${HOME:?HOME is not set}/Library/Application Support/CrossOver/Bottles}"
+
+fail() {
+  printf '%s: error: %s\n' "${PROGRAM_NAME}" "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  cx-sideload --bottle NAME [OPTIONS] INSTALLER [INSTALLER_ARGS...]
+  cx-sideload --list-bottles
+
+Run a Windows .exe or .msi installer in an existing private CrossOver bottle.
+The helper never creates, deletes, stops, or resets bottles.
+
+Options:
+  -b, --bottle NAME       Target bottle (required for installation)
+      --sha256 HASH       Require the installer to match this SHA-256
+  -n, --dry-run           Validate and describe the launch without executing it
+  -y, --yes               Skip the interactive confirmation
+      --detach            Return after launching instead of waiting for children
+      --list-bottles      List available private bottles and exit
+  -h, --help              Show this help
+
+Environment:
+  CROSSOVER_APP           Explicit path to CrossOver.app or CrossOver Preview.app
+  CROSSOVER_BOTTLES_DIR   Override the private bottles directory
+
+Examples:
+  cx-sideload --list-bottles
+  cx-sideload -b Research ~/Downloads/tool-setup.exe
+  cx-sideload -b Research --sha256 HASH ~/Downloads/tool-setup.exe /S
+  cx-sideload -b Research --dry-run ~/Downloads/tool.msi /qn
+
+Use -- before INSTALLER when its path begins with a dash. Installer arguments
+are never evaluated by a shell and are not printed, because they may be secret.
+EOF
+}
+
+list_bottles() {
+  local config bottle_path bottle_name found
+
+  [[ -d "${DEFAULT_BOTTLES_DIR}" ]] || fail "bottles directory does not exist: ${DEFAULT_BOTTLES_DIR}"
+  [[ ! -L "${DEFAULT_BOTTLES_DIR}" ]] || fail "bottles directory must not be a symbolic link: ${DEFAULT_BOTTLES_DIR}"
+
+  found=0
+  for config in "${DEFAULT_BOTTLES_DIR}"/*/cxbottle.conf; do
+    [[ -f "${config}" ]] || continue
+    bottle_path="${config%/cxbottle.conf}"
+    [[ ! -L "${bottle_path}" ]] || continue
+    bottle_name="${bottle_path##*/}"
+    printf '%s\n' "${bottle_name}"
+    found=1
+  done
+
+  (( found == 1 )) || fail "no private bottles found in: ${DEFAULT_BOTTLES_DIR}"
+}
+
+find_crossover_app() {
+  local candidate wine_path
+  local -a candidates
+
+  candidates=()
+  if [[ -n "${CROSSOVER_APP:-}" ]]; then
+    candidates+=("${CROSSOVER_APP%/}")
+  else
+    candidates+=(
+      '/Applications/CrossOver.app'
+      '/Applications/CrossOver Preview.app'
+      "${HOME}/Applications/CrossOver.app"
+      "${HOME}/Applications/CrossOver Preview.app"
+    )
+
+    if [[ -x /usr/bin/mdfind ]]; then
+      while IFS= read -r candidate; do
+        [[ -n "${candidate}" ]] && candidates+=("${candidate%/}")
+      done < <(/usr/bin/mdfind 'kMDItemCFBundleIdentifier == "com.codeweavers.CrossOver"' 2>/dev/null || true)
+    fi
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    [[ "${candidate}" == /* ]] || continue
+    wine_path="${candidate}/Contents/SharedSupport/CrossOver/bin/wine"
+    if [[ -f "${wine_path}" && -x "${wine_path}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  if [[ -n "${CROSSOVER_APP:-}" ]]; then
+    fail "CROSSOVER_APP does not contain an executable CrossOver wine wrapper: ${CROSSOVER_APP}"
+  fi
+  fail 'could not locate CrossOver; set CROSSOVER_APP to its .app bundle'
+}
+
+calculate_sha256() {
+  local digest_line
+
+  if ! digest_line="$(/usr/bin/shasum -a 256 "$1")"; then
+    fail 'could not calculate installer SHA-256'
+  fi
+  printf '%s\n' "${digest_line%% *}"
+}
+
+validate_bottle() {
+  local bottle_name="$1"
+  local bottle_pattern bottle_path
+
+  bottle_pattern='^[A-Za-z0-9][A-Za-z0-9._+() -]*$'
+  (( ${#bottle_name} <= 128 )) || fail 'bottle name is longer than 128 characters'
+  [[ "${bottle_name}" =~ ${bottle_pattern} ]] || fail "invalid bottle name: ${bottle_name}"
+  [[ -d "${DEFAULT_BOTTLES_DIR}" ]] || fail "bottles directory does not exist: ${DEFAULT_BOTTLES_DIR}"
+  [[ ! -L "${DEFAULT_BOTTLES_DIR}" ]] || fail "bottles directory must not be a symbolic link: ${DEFAULT_BOTTLES_DIR}"
+
+  bottle_path="${DEFAULT_BOTTLES_DIR}/${bottle_name}"
+  [[ -d "${bottle_path}" ]] || fail "bottle does not exist: ${bottle_name}"
+  [[ ! -L "${bottle_path}" ]] || fail "bottle must not be a symbolic link: ${bottle_name}"
+  [[ -O "${bottle_path}" ]] || fail "bottle is not owned by the current user: ${bottle_name}"
+  [[ -f "${bottle_path}/cxbottle.conf" ]] || fail "bottle is missing cxbottle.conf: ${bottle_name}"
+}
+
+bottle=''
+expected_sha256=''
+dry_run=0
+assume_yes=0
+detach=0
+list_only=0
+
+while (( $# > 0 )); do
+  case "$1" in
+    -b|--bottle)
+      (( $# >= 2 )) || fail "$1 requires a value"
+      bottle="$2"
+      shift 2
+      ;;
+    --bottle=*)
+      bottle="${1#*=}"
+      shift
+      ;;
+    --sha256)
+      (( $# >= 2 )) || fail "$1 requires a value"
+      expected_sha256="$2"
+      shift 2
+      ;;
+    --sha256=*)
+      expected_sha256="${1#*=}"
+      shift
+      ;;
+    -n|--dry-run)
+      dry_run=1
+      shift
+      ;;
+    -y|--yes)
+      assume_yes=1
+      shift
+      ;;
+    --detach)
+      detach=1
+      shift
+      ;;
+    --list-bottles)
+      list_only=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      fail "unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if (( list_only == 1 )); then
+  (( $# == 0 )) || fail '--list-bottles does not accept positional arguments'
+  [[ -z "${bottle}" ]] || fail '--list-bottles cannot be combined with --bottle'
+  list_bottles
+  exit 0
+fi
+
+[[ -n "${bottle}" ]] || fail 'a target bottle is required; use --bottle NAME'
+(( $# >= 1 )) || fail 'an installer path is required'
+
+installer_input="$1"
+shift
+installer_args=("$@")
+
+[[ "${installer_input}" != *$'\n'* && "${installer_input}" != *$'\r'* && "${installer_input}" != *$'\033'* ]] ||
+  fail 'installer path contains a forbidden control character'
+[[ "${installer_input}" == /* ]] || installer_input="${PWD}/${installer_input}"
+[[ -e "${installer_input}" ]] || fail "installer does not exist: ${installer_input}"
+[[ -f "${installer_input}" ]] || fail "installer is not a regular file: ${installer_input}"
+[[ ! -L "${installer_input}" ]] || fail "installer must not be a symbolic link: ${installer_input}"
+[[ -r "${installer_input}" ]] || fail "installer is not readable: ${installer_input}"
+
+installer_dir="$(cd -P "$(/usr/bin/dirname "${installer_input}")" && pwd)" || fail 'could not resolve installer directory'
+installer="${installer_dir}/$(/usr/bin/basename "${installer_input}")"
+extension="$(printf '%s' "${installer##*.}" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+file_description="$(/usr/bin/file -b "${installer}")" || fail 'could not inspect installer file type'
+
+case "${extension}" in
+  exe)
+    [[ "${file_description}" == *PE32* || "${file_description}" == *MS-DOS\ executable* ]] ||
+      fail "the .exe does not look like a Windows executable: ${file_description}"
+    ;;
+  msi)
+    [[ "${file_description}" == *MSI\ Installer* || "${file_description}" == *Microsoft\ Installer* || "${file_description}" == *Installation\ Database* ]] ||
+      fail "the .msi does not look like a Windows Installer package: ${file_description}"
+    ;;
+  *)
+    fail 'unsupported installer type; only .exe and .msi are accepted'
+    ;;
+esac
+
+validate_bottle "${bottle}"
+
+actual_sha256="$(calculate_sha256 "${installer}")"
+[[ "${actual_sha256}" =~ ^[0-9a-f]{64}$ ]] || fail 'SHA-256 tool returned an invalid digest'
+
+if [[ -n "${expected_sha256}" ]]; then
+  expected_sha256="$(printf '%s' "${expected_sha256}" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+  [[ "${expected_sha256}" =~ ^[0-9a-f]{64}$ ]] || fail '--sha256 must be exactly 64 hexadecimal characters'
+  [[ "${actual_sha256}" == "${expected_sha256}" ]] || fail "SHA-256 mismatch (actual: ${actual_sha256})"
+fi
+
+crossover_app="$(find_crossover_app)"
+wine_path="${crossover_app}/Contents/SharedSupport/CrossOver/bin/wine"
+
+printf 'CrossOver: %s\n' "${crossover_app}"
+printf 'Bottle: %s\n' "${bottle}"
+printf 'Installer: %s\n' "${installer}"
+printf 'Type: .%s (%s)\n' "${extension}" "${file_description}"
+printf 'SHA-256: %s\n' "${actual_sha256}"
+printf 'Installer arguments: %d (not printed)\n' "${#installer_args[@]}"
+
+command=(
+  "${wine_path}"
+  --bottle "${bottle}"
+  --untrusted
+  --workdir "${installer_dir}"
+)
+
+if (( detach == 1 )); then
+  command+=(--no-wait)
+else
+  command+=(--wait-children)
+fi
+
+if [[ "${extension}" == 'msi' ]]; then
+  command+=(msiexec.exe /i "${installer}")
+else
+  command+=("${installer}")
+fi
+if (( ${#installer_args[@]} > 0 )); then
+  command+=("${installer_args[@]}")
+fi
+
+if (( dry_run == 1 )); then
+  printf 'Dry run complete; nothing was executed.\n'
+  exit 0
+fi
+
+if (( assume_yes == 0 )); then
+  [[ -t 0 ]] || fail 'interactive confirmation requires a terminal; use --yes to proceed'
+  printf 'Type YES to run this untrusted installer in bottle %q: ' "${bottle}" >&2
+  IFS= read -r confirmation
+  [[ "${confirmation}" == 'YES' ]] || {
+    printf 'Cancelled.\n' >&2
+    exit 130
+  }
+fi
+
+[[ -f "${installer}" && ! -L "${installer}" ]] || fail 'installer changed after validation'
+launch_sha256="$(calculate_sha256 "${installer}")"
+[[ "${launch_sha256}" == "${actual_sha256}" ]] || fail 'installer contents changed after validation'
+
+set +e
+"${command[@]}"
+status=$?
+set -e
+
+if (( status != 0 )); then
+  fail "CrossOver returned exit status ${status}"
+fi
+
+if (( detach == 1 )); then
+  printf 'CrossOver accepted the launch request; installation completion was not verified.\n'
+else
+  printf 'Installer process tree exited successfully. Verify the application inside the bottle before relying on it.\n'
+fi
